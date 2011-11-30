@@ -1,0 +1,21 @@
+<clone-and-delete-vms>
+  <server>10.10.10.10</server>
+  <username>vmbackup</username>
+  <password>sekret</password>
+  <backupPeriod>6</backupPeriod>
+  <targetFolder>BACKUP</targetFolder>
+
+  <targetBackups>
+    <target>
+      <name>server1</name>
+      <datastore>TEST1</datastore>
+      <cluster>TEST1</cluster>
+    </target>
+
+    <target>
+       <name>server2</name>
+      <datastore>TEST2</datastore>
+      <cluster>TEST2</cluster>
+    </target>
+  </targetBackups>
+</clone-and-delete-vms>

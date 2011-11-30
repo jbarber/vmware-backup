@@ -2,7 +2,7 @@
   <server>10.10.10.10</server>
   <username>vmbackup</username>
   <password>sekret</password>
-  <backupPeriod>6</backupPeriod>
+  <retention>6</retention>
   <targetFolder>BACKUP</targetFolder>
 
   <targetBackups>

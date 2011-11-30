@@ -74,11 +74,11 @@ Param(
 if (Test-path $config) {
   $doc = [xml](get-content $config)
   $xml = $doc.FirstChild
-  $server = $xml.server
-  $username = $xml.username
-  $password = $xml.password
-  $retention = $xml.retention
-  $targetFolder = $xml.targetFolder
+  if ($xml.server    -ne $null) { $server = $xml.server }
+  if ($xml.username  -ne $null) { $username = $xml.username }
+  if ($xml.password  -ne $null) { $password = $xml.password }
+  if ($xml.retention -ne $null) { $retention = $xml.retention }
+  if ($xml.targetFolder -ne $null) { $targetFolder = $xml.targetFolder }
 
   $new_retention = $doc.CreateElement("retention")
   [void]$new_retention.set_InnerXML($retention)

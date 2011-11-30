@@ -3,9 +3,9 @@
   Backups VMware VMs by cloning them
 .DESCRIPTION
 
-Script to clone VMs to new VM with suffix -backup-YYYY-MM-DDTHH:MM. It will not take a backup if an older backup exists which is less that $backupPeriod days
+Script to clone VMs to new VM with suffix -backup-YYYY-MM-DDTHH:MM.
 
-Backups older than $backupPeriod are deleted - after the backup is taken.
+Backups older than $retention are deleted - after the backup is taken.
 
 Backups created during this scripts execution are not deleted during the same run of the script.
 
@@ -16,7 +16,7 @@ The configuration file is an XML file with the following structure:
     <server>my-vc-server</server>
     <username>vmbackup</username>
     <password>sekret</password>
-    <backupPeriod>6</backupPeriod>
+    <retention>6</retention>
     <targetFolder>BACKUP</targetFolder>
   
     <targetBackups>
@@ -25,6 +25,7 @@ The configuration file is an XML file with the following structure:
         <datastore>DATASTORE2</datastore>
         <cluster>Cluster 2</cluster>
       </target>
+      <target>
         <name>host2</name>
         <datastore>DATASTORE1</datastore>
         <cluster>Cluster 1</cluster>
@@ -40,34 +41,55 @@ The author is Jonathan Barber <jonathan.barber@gmail.com>.
   Username to connect to Virtual Center with. Defaults to vmbackup
 .PARAMETER password
   Password to use to connect to Virtual Center. No default value.
-.PARAMETER backupPeriod
+.PARAMETER retention
   Minimum number of days between which VM should be backed up. Defaults to 6.
 .PARAMETER targetFolder
   Folder that VMs are cloned to. Defaults to BACKUP
 .PARAMETER config
   Path to configuration XML file. Defaults to "clone-and-delete-vms.xml"
+.PARAMETER verbose
+  Switch for more logging
+.PARAMETER dryrun
+  Switch to disable taking backups and deleting old backups 
+.PARAMETER nobackup
+  Disable taking backups
+.PARAMETER nodelete
+  Disable deleting old backups
 #>
 
 Param(
   [string]$server = "127.0.0.1",
   [string]$username = "vmbackup",
   [string]$password,
-  [int]$backupPeriod = 6,
+  [int]$retention = 6,
   [string]$targetFolder = "BACKUP",
-  [string]$config = "clone-and-delete-vms.xml"
+  [string]$config = "clone-and-delete-vms.xml",
+  [switch]$verbose = $False,
+  [switch]$dryrun = $False,
+  [switch]$nobackup = $False,
+  [switch]$nodelete = $False
 )
 
 # Read the config
 if (Test-path $config) {
-  $xml = ([xml](get-content $config)).FirstChild
+  $doc = [xml](get-content $config)
+  $xml = $doc.FirstChild
   $server = $xml.server
   $username = $xml.username
   $password = $xml.password
-  $backupPeriod = $xml.backupPeriod
+  $retention = $xml.retention
+  $targetFolder = $xml.targetFolder
+
+  $new_retention = $doc.CreateElement("retention")
+  [void]$new_retention.set_InnerXML($retention)
 
   $targetBackups = @{}
   $xml.targetBackups.target | %{ 
-    $targetBackups.Add( $_.name, $_ ) }
+    if (-not $_.retention) {
+      [void]$_.AppendChild($new_retention)
+    }
+    [void]$targetBackups.Add( $_.name, $_ )
+  }
 }
 
 # check options are set after reading config
@@ -86,14 +108,28 @@ if (! $password) {
   exit 1
 }
 
-Add-PSSnapin Vmware*
-$ErrorActionPreference = "Stop"
-Connect-VIserver -server $server -username $username -password $password
+if ($verbose) {
+  $VerbosePreference = "Continue"
+}
+
+# Only load a Snappin if it's not already registered
+function addSnappin (
+  [parameter(Mandatory = $true)][string]$snappin
+) {
+  if (-not (get-pssnapin | ?{ $_.name -eq $snappin })) {
+    Add-PSSnapin $snappin
+  }
+}
 
 $evt = New-Object System.Diagnostics.EventLog("Application")
 $evt.Source = $MyInvocation.MyCommand.Name
-
-$evt.WriteEntry("Starting script")
+function evtLog {
+  try {
+    $evt.WriteEntry( $args )
+  }
+  catch {
+  }
+}
 
 function Clone-VM (
   [parameter(Mandatory = $true)][string]$sourceVM,
@@ -144,12 +180,15 @@ function Clone-VM (
     $VMCloneSpec.Location.Transform = [VMware.Vim.VirtualMachineRelocateTransformation]::sparse
   }
   
-  Write-verbose "Cloning $sourceVM to $targetVM in folder $targetFolderName"
-  (Get-View ( Get-VM -Name $sourceVM).ID).CloneVM_Task($targetFolder.MoRef, $targetVM, $VMCloneSpec)
+  write-verbose "Cloning $sourceVM to $targetVM in folder $targetFolderName"
+  return (Get-View (Get-VM -Name $sourceVM).ID).CloneVM_Task($targetFolder.MoRef, $targetVM, $VMCloneSpec)
 }
 
-# Match $VMname with $regex, and return how long ago the backup was made
-function backupAge ([string]$VMname, [string]$regex) {
+# Match $VMname with $regex and return how long ago the backup was made
+function backupAge (
+  [string]$VMname,
+  [string]$regex
+) {
   if ($VMname -match $regex) {
     return ((get-date) - (get-date -date $matches[2]))
   }
@@ -158,53 +197,126 @@ function backupAge ([string]$VMname, [string]$regex) {
   }
 }
 
-# Regex to find backup clones and extract their base VM name and when they were created
-$backupMatch = '(.*)-backup-(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})$'
+# Return whether the VM was backed up more than $age days ago
+function backupOld (
+  [string]$VMname,
+  [string]$regex,
+  [int]$age
+) {
+    return (backupAge -VMname $VMname -regex $regex).Days -ge $age
+}
 
-# Clone VMs that aren't a backup in their name and that have backups older than $backupPeriod
-$vms = get-vm
-$vms | %{ $_.name } | ?{ -not ($_ -match $backupMatch) } | ?{ $targetBackups.containsKey( $_ ) } | %{
-  # This date format *must* match $backupMatch - otherwise you'll never delete old backups
-  $date = get-date -uformat %Y-%m-%dT%R
-  $src = $_
-  $target = $src, "backup", $date -join "-"
-  $targetStore = $targetBackups[$src].datastore
-  $targetCluster = $targetBackups[$src].cluster
+function backupVMs (
+  [array]$vms,
+  [string]$backupMatch,
+  [int]$retention,
+  [string]$dateFormat,
+  $targetBackups
+) {
+  $vms | %{ $_.name } | ?{ -not ($_ -match $backupMatch) } | ?{ $targetBackups.containsKey( $_ ) } | %{
+    $date = get-date -uformat $dateFormat
+    $src = $_
+    $target = ($src, "backup", $date) -join "-"
+    $targetStore = $targetBackups[$src].datastore
+    $targetCluster = $targetBackups[$src].cluster
 
-  # Check if the $src has a backup
-  $backup = $false
-  if ( $backups = ($vms | %{ $_.name } | ?{ ($_ -like "$src-*") -and ($_ -match $backupMatch) }) ) {
-    write-verbose "$src has backups"
-    $evt.WriteEntry( "$src has backups" )
-    # If $src does have a backup, see if the backup is older than $backupPeriod
-    if ( $backups | ?{ ((backupAge -VMname $_ -regex $backupMatch).Days -ge $backupPeriod) } ) {
-      $backup = $true
-      write-verbose "$src backups are stale"
-      $evt.WriteEntry( "$src backups are stale" )
-    }
-    else {
-      write-verbose "$src backups are fresh"
-      $evt.WriteEntry( "$src backups are fresh" )
-    }
-  }
-  else {
-    $backup = $true
-    write-verbose "$src doesn't have backups"
-    $evt.WriteEntry( "$src doesn't have backups" )
-  }
+    # Check if the $src has a backup
+    $backup = $false
+#    if ( $backups = ($vms | %{ $_.name } | ?{ ($_ -like "$src-*") -and ($_ -match $backupMatch) }) ) {
+#      write-verbose "$src has backups"
+##      $evt.WriteEntry( "$src has backups" )
+#      # See if any of the backups are old
+#      if ( $backups | ?{ backupOld $_ $backupMatch $retention } ) {
+#        $backup = $true
+#        write-verbose "$src backups are stale"
+##        $evt.WriteEntry( "$src backups are stale" )
+#      }
+#      else {
+#        write-verbose "$src backups are fresh"
+##        $evt.WriteEntry( "$src backups are fresh" )
+#      }
+#    }
+#    else {
+#      $backup = $true
+#      write-verbose "$src doesn't have backups"
+##      $evt.WriteEntry( "$src doesn't have backups" )
+#    }
  
-  if ($backup) {
-    write-verbose "Taking backup of $src"
-    $evt.WriteEntry( "Taking backup of $src" )
-    wait-task (get-viobjectbyviview (Clone-VM -sourceVM $src -targetVM $target -targetDatastore $targetStore -targetFolderName $targetFolder -sparse -targetCluster $targetCluster))
+    $backup = $true
+    if ($backup) {
+      write-verbose "Taking backup of $src"
+      evtLog "Taking backup of $src"
+      if ($dryrun) {
+        write-verbose "In dryrun mode, not cloning"
+      }
+      else {
+        return wait-task (get-viobjectbyviview (Clone-VM -sourceVM $src -targetVM $target -targetDatastore $targetStore -targetFolderName $targetFolder -sparse -targetCluster $targetCluster))
+      }
+    }
   }
 }
 
 # Look for old backups and delete them
-$vms | ?{ $_.name -match $backupMatch } | %{ $_.name } | %{
-  if ( (backupAge -VMname $_ -regex $backupMatch ).Days -ge $backupPeriod ) {
-    write-verbose "Deleting $_"
-    $evt.WriteEntry( "Deleting $_" )
-    remove-vm -deletefromdisk -runasync -confirm:$false -vm $_
+function deleteOldBackups (
+  [array]$vms,
+  [string]$backupMatch,
+  [int]$retention,
+  $targetBackups
+) {
+  write-verbose "Looking for old backups:"
+  $candidates = $vms | ?{ $_.name -match $backupMatch } | %{ $_.name } 
+
+  foreach ($vm in $candidates) {
+    write-verbose "  VM found: $vm"
+
+    $targets = $targetBackups.getEnumerator() | ?{ $vm -like ($_.name + "-*") }
+    if (-not $targets) {
+      write-verbose "  - not found in targetBackups, ignoring"
+      continue
+    }
+    if ($targets.count -gt 1) {
+      write-verbose "  - name matches more than one target!"
+    }
+
+    # TODO: Select one element from $targets and use the retention time from
+    # that element
+    #$target = $targets[0].value
+    #write-verbose ("  - VM age is " + (backupAge -VMname $vm -regex $backupMatch))
+
+    if (backupOld $vm $backupMatch $retention) {
+      write-verbose "  - older than $retention, deleting"
+      evtLog "Deleting $vm"
+      if ($dryrun) {
+        write-verbose "  - In dryrun mode, not deleting"
+      }
+      else {
+        remove-vm -deletefromdisk -runasync -confirm:$false -vm $vm
+      }
+    }
+    else {
+      write-verbose "  - younger than $retention, keeping"
+    }
   }
 }
+
+# Regex to find backup clones and extract their base VM name and when they were created
+$backupMatch = '(.*)-backup-(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})$'
+# This date format is used to name the backups, and it *must* match
+# $backupMatch - otherwise you'll never delete old backups
+$dateFormat  = '%Y-%m-%dT%R'
+$ErrorActionPreference = "Stop"
+
+evtLog "Starting script"
+addSnappin 'VMware.VimAutomation.Core'
+Connect-VIserver -server $server -username $username -password $password
+
+# Clone VMs that aren't a backup in their name and that have backups older than $retention
+$vms = get-vm
+if (-not $nobackup) {
+  backupVMs $vms $backupMatch $retention $dateFormat $targetBackups
+}
+if (-not $nodelete) {
+  deleteOldBackups $vms $backupMatch $retention $targetBackups
+}
+evtLog "Stopping script"
+disconnect-viserver -force -server * -confirm:$false

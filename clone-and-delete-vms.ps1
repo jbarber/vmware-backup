@@ -213,9 +213,10 @@ function backupVMs (
   [string]$dateFormat,
   $targetBackups
 ) {
-  $vms | %{ $_.name } | ?{ -not ($_ -match $backupMatch) } | ?{ $targetBackups.containsKey( $_ ) } | %{
+  $targets = $vms | %{ $_.name } | ?{ -not ($_ -match $backupMatch) } | ?{ $targetBackups.containsKey( $_ ) } 
+
+  foreach ($src in $targets) {
     $date = get-date -uformat $dateFormat
-    $src = $_
     $target = ($src, "backup", $date) -join "-"
     $targetStore = $targetBackups[$src].datastore
     $targetCluster = $targetBackups[$src].cluster
@@ -250,7 +251,13 @@ function backupVMs (
         write-verbose "In dryrun mode, not cloning"
       }
       else {
-        return wait-task (get-viobjectbyviview (Clone-VM -sourceVM $src -targetVM $target -targetDatastore $targetStore -targetFolderName $targetFolder -sparse -targetCluster $targetCluster))
+        try {
+          return wait-task (get-viobjectbyviview (Clone-VM -sourceVM $src -targetVM $target -targetDatastore $targetStore -targetFolderName $targetFolder -sparse -targetCluster $targetCluster))
+        }
+        catch {
+          evtLog ("Cloning $vm failed: " + $_.Exception.Message)
+          write-verbose ("Cloning $vm failed: " + $_.Exception.Message)
+        }
       }
     }
   }
@@ -290,7 +297,13 @@ function deleteOldBackups (
         write-verbose "  - In dryrun mode, not deleting"
       }
       else {
-        remove-vm -deletefromdisk -runasync -confirm:$false -vm $vm
+        try {
+          remove-vm -deletefromdisk -runasync -confirm:$false -vm $vm
+        }
+        catch {
+          evtLog ("Delting $vm failed: " + $_.Exception.Message)
+          write-verbose ("  - deletion failed: " + $_.Exception.Message)
+        }
       }
     }
     else {

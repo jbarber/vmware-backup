@@ -252,7 +252,7 @@ function backupVMs (
       }
       else {
         try {
-          return wait-task (get-viobjectbyviview (Clone-VM -sourceVM $src -targetVM $target -targetDatastore $targetStore -targetFolderName $targetFolder -sparse -targetCluster $targetCluster))
+          wait-task (get-viobjectbyviview (Clone-VM -sourceVM $src -targetVM $target -targetDatastore $targetStore -targetFolderName $targetFolder -sparse -targetCluster $targetCluster))
         }
         catch {
           evtLog ("Cloning $vm failed: " + $_.Exception.Message)
